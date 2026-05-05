@@ -3,7 +3,7 @@
   "displayName": "custom-include-resolver",
   "description": "Resolve custom include paths",
   "repository": "https://github.com/salikq/custom-include-resolver",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "",
   "engines": {
     "vscode": "^1.90.0"
