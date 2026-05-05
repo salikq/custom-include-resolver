@@ -44,13 +44,15 @@ Create `.custom-include-workspace.json` in each workspace folder root.
 ```json
 {
   "prefix": "$MODULE:",
+  "modules": {
+    "common": "./engine/render/shaders",
+    "game_shared": "./game/modules/game_shared/shaders"
+  },
   "languages": ["cpp", "glsl", "yaml"],
   "extensions": [".hlsl", ".hlsli", ".glsl", ".yaml"],
-  "diagnostics": true,
-  "modules": {
-    "render": "./modules/render_sce/res/render",
-    "devui": "./modules/devui/res/devui"
-  }
+  "diagnostics": false,
+  "documentLinks": true,
+  "workspaceScope": false
 }
 ```
 
@@ -71,6 +73,8 @@ Create `.custom-include-workspace.json` in each workspace folder root.
   - Show unresolved include/module warnings in `Problems`.
 - `documentLinks` (boolean, optional, default `true`)
   - Enable/disable `DocumentLinkProvider` for include tokens.
+- `workspaceScope` (boolean, optional, default `false`)
+  - resolve modules from all workspace roots that have `.custom-include-workspace.json`.
 
 ---
 

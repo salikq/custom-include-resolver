@@ -17,6 +17,7 @@ interface WorkspaceResolverConfig {
   languages: string[]; // parsed source language ids, e.g. ["cpp", "glsl"]
   diagnostics?: boolean; // optional diagnostics in Problems
   documentLinks?: boolean; // enable document links
+  workspaceScope?: boolean; // resolve paths in workspace scope 
 }
 
 interface WorkspaceState {
@@ -24,8 +25,6 @@ interface WorkspaceState {
   config: WorkspaceResolverConfig;
 
   moduleAbsPaths: Map<string, string>; // module -> absolute path
-  moduleConcretePrefixes: Map<string, string>; // module -> prefix with $MODULE substituted
-  modulesByConcretePrefixLengthDesc: string[];
 
   prefixParseRegex: RegExp; // generic parse: prefix + path remainder
   fileIndexByModule: Map<string, Set<string>>; // module -> relative file paths ("/" separated)
@@ -245,12 +244,16 @@ async function provideCompletionItems(
     return null;
   }
 
-  const prefixMatch = matchTypedPrefixForCompletion(ctx.valueBeforeCursor, state);
+  const prefixMatch = matchTypedPrefixForCompletion(
+    ctx.valueBeforeCursor,
+    state,
+    getVisibleModuleNames(state)
+  );
   if (!prefixMatch) {
     return null;
   }
 
-  const moduleFiles = state.fileIndexByModule.get(prefixMatch.moduleName) ?? new Set<string>();
+  const moduleFiles = getIndexedFilesForModule(state, prefixMatch.moduleName);
   const partialPath = prefixMatch.partialPath.replace(/\\/g, '/');
 
   const lastSlash = partialPath.lastIndexOf('/');
@@ -389,13 +392,13 @@ async function updateDiagnosticsForDocument(document: vscode.TextDocument): Prom
         continue;
       }
 
-      const moduleBase = state.moduleAbsPaths.get(parsed.moduleName);
       const range = new vscode.Range(
         new vscode.Position(lineNum, token.contentStart),
         new vscode.Position(lineNum, token.contentEndExclusive)
       );
 
-      if (!moduleBase) {
+      const roots = getModuleRootsForName(state, parsed.moduleName);
+      if (roots.length === 0) {
         out.push(
           new vscode.Diagnostic(
             range,
@@ -406,8 +409,14 @@ async function updateDiagnosticsForDocument(document: vscode.TextDocument): Prom
         continue;
       }
 
-      const candidates = buildCandidatePaths(moduleBase, parsed.includePath, state.config.extensions);
-      const existing = await existingUris(candidates);
+      const candidateAbs = new Set<string>();
+      for (const r of roots) {
+        for (const p of buildCandidatePaths(r.absRoot, parsed.includePath, state.config.extensions)) {
+          candidateAbs.add(p);
+        }
+      }
+
+      const existing = await existingUris([...candidateAbs]);
       if (existing.length === 0) {
         out.push(
           new vscode.Diagnostic(
@@ -424,6 +433,48 @@ async function updateDiagnosticsForDocument(document: vscode.TextDocument): Prom
 }
 
 /* --------------------------- Resolve / Parse --------------------------- */
+
+function getResolutionStates(current: WorkspaceState): WorkspaceState[] {
+  return current.config.workspaceScope ? [...states.values()] : [current];
+}
+
+function getModuleRootsForName(
+  current: WorkspaceState,
+  moduleName: string
+): Array<{ owner: WorkspaceState; absRoot: string }> {
+  const out: Array<{ owner: WorkspaceState; absRoot: string }> = [];
+  for (const st of getResolutionStates(current)) {
+    const root = st.moduleAbsPaths.get(moduleName);
+    if (root) {
+      out.push({ owner: st, absRoot: root });
+    }
+  }
+  return out;
+}
+
+function getVisibleModuleNames(current: WorkspaceState): string[] {
+  if (!current.config.workspaceScope) {
+    return [...current.moduleAbsPaths.keys()];
+  }
+
+  const set = new Set<string>();
+  for (const st of states.values()) {
+    for (const m of st.moduleAbsPaths.keys()) {
+      set.add(m);
+    }
+  }
+  return [...set];
+}
+
+function getIndexedFilesForModule(current: WorkspaceState, moduleName: string): Set<string> {
+  const out = new Set<string>();
+  for (const st of getResolutionStates(current)) {
+    const idx = st.fileIndexByModule.get(moduleName);
+    if (!idx) continue;
+    for (const p of idx) out.add(p);
+  }
+  return out;
+}
 
 function getStateForDocument(document: vscode.TextDocument): WorkspaceState | null {
   const folder = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -457,18 +508,24 @@ async function resolveIncludeToExistingFiles(
     return null;
   }
 
-  const moduleBase = state.moduleAbsPaths.get(parsed.moduleName);
-  if (!moduleBase) {
-    log(`[${state.folder.name}] Unknown module "${parsed.moduleName}" in include "${includeRaw}"`);
-    return null;
-  }
-
   if (!parsed.includePath) {
     return null;
   }
 
-  const candidates = buildCandidatePaths(moduleBase, parsed.includePath, state.config.extensions);
-  const uris = await existingUris(candidates);
+  const roots = getModuleRootsForName(state, parsed.moduleName);
+  if (roots.length === 0) {
+    log(`[${state.folder.name}] Unknown module "${parsed.moduleName}" in include "${includeRaw}"`);
+    return null;
+  }
+
+  const candidateAbs = new Set<string>();
+  for (const r of roots) {
+    for (const p of buildCandidatePaths(r.absRoot, parsed.includePath, state.config.extensions)) {
+      candidateAbs.add(p);
+    }
+  }
+
+  const uris = await existingUris([...candidateAbs]);
   return { moduleName: parsed.moduleName, includePath: parsed.includePath, uris };
 }
 
@@ -493,18 +550,23 @@ function parseIncludeByPrefixTemplate(
 
 function matchTypedPrefixForCompletion(
   typedTokenBeforeCursor: string,
-  state: WorkspaceState
+  state: WorkspaceState,
+  moduleNames: string[]
 ): { moduleName: string; concretePrefix: string; partialPath: string } | null {
-  for (const moduleName of state.modulesByConcretePrefixLengthDesc) {
-    const concretePrefix = state.moduleConcretePrefixes.get(moduleName);
-    if (!concretePrefix) {
-      continue;
-    }
+  const entries = moduleNames
+    .map((moduleName) => ({
+      moduleName,
+      concretePrefix: state.config.prefix.replace('$MODULE', moduleName)
+    }))
+    .sort((a, b) => b.concretePrefix.length - a.concretePrefix.length);
 
-    // completion starts only after full concrete prefix is typed
-    if (typedTokenBeforeCursor.startsWith(concretePrefix)) {
-      const partialPath = typedTokenBeforeCursor.slice(concretePrefix.length);
-      return { moduleName, concretePrefix, partialPath };
+  for (const e of entries) {
+    if (typedTokenBeforeCursor.startsWith(e.concretePrefix)) {
+      return {
+        moduleName: e.moduleName,
+        concretePrefix: e.concretePrefix,
+        partialPath: typedTokenBeforeCursor.slice(e.concretePrefix.length)
+      };
     }
   }
 
@@ -754,23 +816,10 @@ async function loadConfigForFolder(folder: vscode.WorkspaceFolder): Promise<void
     moduleAbsPaths.set(moduleName, path.resolve(folder.uri.fsPath, relPath));
   }
 
-  const moduleConcretePrefixes = new Map<string, string>();
-  for (const moduleName of Object.keys(cfg.modules)) {
-    moduleConcretePrefixes.set(moduleName, cfg.prefix.replace('$MODULE', moduleName));
-  }
-
-  const modulesByConcretePrefixLengthDesc = [...moduleConcretePrefixes.keys()].sort((a, b) => {
-    const pa = moduleConcretePrefixes.get(a) ?? '';
-    const pb = moduleConcretePrefixes.get(b) ?? '';
-    return pb.length - pa.length;
-  });
-
   const state: WorkspaceState = {
     folder,
     config: cfg,
     moduleAbsPaths,
-    moduleConcretePrefixes,
-    modulesByConcretePrefixLengthDesc,
     prefixParseRegex,
     fileIndexByModule: new Map(),
     moduleWatchDisposables: []
@@ -922,6 +971,7 @@ function validateAndNormalizeConfig(data: unknown): WorkspaceResolverConfig | nu
   const languagesRaw = Array.isArray(data.languages) ? data.languages : [];
   const diagnosticsRaw = typeof data.diagnostics === 'boolean' ? data.diagnostics : false;
   const documentLinksRaw = typeof data.documentLinks === 'boolean' ? data.documentLinks : true;
+  const workspaceScopeRaw = typeof data.workspaceScope === 'boolean' ? data.workspaceScope : false;
 
   if (!prefix || !modulesRaw) {
     return null;
@@ -950,7 +1000,8 @@ function validateAndNormalizeConfig(data: unknown): WorkspaceResolverConfig | nu
     extensions,
     languages,
     diagnostics: diagnosticsRaw,
-    documentLinks: documentLinksRaw
+    documentLinks: documentLinksRaw,
+    workspaceScope: workspaceScopeRaw
   };
 }
 
